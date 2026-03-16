@@ -1,6 +1,6 @@
 use super::{SubDevice, SubDeviceRef};
 use crate::{
-    coe::{SdoExpedited, SubIndex},
+    SubIndex,
     eeprom::types::{
         CoeDetails, DefaultMailbox, FmmuUsage, MailboxProtocols, SiiGeneral, SiiOwner, SyncManager,
         SyncManagerEnable, SyncManagerType,
@@ -8,6 +8,7 @@ use crate::{
     error::{Error, IgnoreNoCategory, Item},
     fmmu::Fmmu,
     fmt,
+    mailbox::coe::SdoExpeditedPayload,
     pdi::{PdiOffset, PdiSegment},
     register::RegisterAddress,
     subdevice::types::{Mailbox, MailboxConfig},
@@ -125,7 +126,6 @@ where
 
         Ok(global_offset)
     }
-
     async fn write_sm_config(
         &self,
         sync_manager_index: u8,
@@ -139,7 +139,9 @@ where
             control: sync_manager.control,
             status: Status::default(),
             enable: Enable {
-                enable: sync_manager.enable.contains(SyncManagerEnable::ENABLE),
+                // Only enable if EEPROM says so and we actually have data to map.
+                // If length is 0, the device rejects the config (InvalidInput/OutputConfiguration).
+                enable: sync_manager.enable.contains(SyncManagerEnable::ENABLE) && length_bytes > 0,
                 ..Enable::default()
             },
         };
@@ -351,6 +353,8 @@ where
                     num_mappings
                 );
 
+                let mut pdo_bit_len = 0u16;
+
                 for i in 1..=num_mappings {
                     /// Defined in ETG1000.6 Table 74/Table 75 Receive PDO Mapping.
                     ///
@@ -367,7 +371,7 @@ where
                         index: u16,
                     }
 
-                    impl SdoExpedited for Mapping {}
+                    impl SdoExpeditedPayload for Mapping {}
 
                     let Mapping {
                         index,
@@ -384,8 +388,25 @@ where
                         mapping_bit_len,
                     );
 
-                    sm_bit_len += u16::from(mapping_bit_len);
+                    pdo_bit_len += u16::from(mapping_bit_len);
                 }
+
+                let oversampling = self
+                    .oversampling_config
+                    .iter()
+                    .find_map(|(pdo_id, mul)| if *pdo_id == pdo { Some(*mul) } else { None })
+                    .unwrap_or(1);
+
+                let pdo_bit_len = pdo_bit_len * u16::from(oversampling);
+
+                fmt::trace!(
+                    "----> CoE: {:#06x} oversampling: {}, this PDO bit len {}",
+                    pdo,
+                    oversampling,
+                    pdo_bit_len
+                );
+
+                sm_bit_len += u16::from(pdo_bit_len);
             }
 
             fmt::trace!(
@@ -521,7 +542,30 @@ where
             let bit_len = pdos
                 .iter()
                 .filter(|pdo| pdo.sync_manager == sync_manager_index)
-                .map(|pdo| pdo.bit_len)
+                .map(|pdo| {
+                    let oversampling = self
+                        .oversampling_config
+                        .iter()
+                        .find_map(|(pdo_id, mul)| {
+                            if *pdo_id == pdo.index {
+                                Some(*mul)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(1);
+
+                    let len = pdo.bit_len * u16::from(oversampling);
+
+                    fmt::trace!(
+                        "EEPROM: {:#06x} oversampling: {}, this PDO bit len {}",
+                        pdo.index,
+                        oversampling,
+                        len
+                    );
+
+                    len
+                })
                 .sum();
 
             // total_bit_len += bit_len;

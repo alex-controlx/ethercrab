@@ -1,18 +1,4 @@
-//! Demonstrate setting outputs using a Beckhoff EK1100/EK1501 and modules.
-//!
-//! Run with e.g.
-//!
-//! Linux
-//!
-//! ```bash
-//! RUST_LOG=debug cargo run --example ek1100 --release -- eth0
-//! ```
-//!
-//! Windows
-//!
-//! ```ps
-//! $env:RUST_LOG="debug" ; cargo run --example ek1100 --release -- '\Device\NPF_{FF0ACEE6-E8CD-48D5-A399-619CD2340465}'
-//! ```
+//! Demonstrate interleaving SDO reads with process data TX/RX.
 
 use env_logger::Env;
 use ethercrab::{
@@ -57,7 +43,9 @@ fn main() -> Result<(), Error> {
         let maindevice = Arc::new(MainDevice::new(
             pdu_loop,
             Timeouts {
-                wait_loop_delay: Duration::from_millis(2),
+                // Reduce wait loop delay to zero so SDO reads are as fast as possible. This isn't
+                // necessary, but helps reduce SDO read transaction times.
+                wait_loop_delay: Duration::from_millis(0),
                 mailbox_response: Duration::from_millis(1000),
                 ..Default::default()
             },
@@ -125,27 +113,59 @@ fn main() -> Result<(), Error> {
         signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
             .expect("Register hook");
 
-        loop {
-            // Graceful shutdown on Ctrl + C
-            if shutdown.load(Ordering::Relaxed) {
-                log::info!("Shutting down...");
+        // A contrived task that reads all SubDevice names every few seconds
+        let sdo_task = async {
+            loop {
+                // Graceful shutdown on Ctrl + C
+                if shutdown.load(Ordering::Relaxed) {
+                    log::info!("Shutting down...");
 
-                break;
-            }
+                    break;
+                }
 
-            group.tx_rx(&maindevice).await.expect("TX/RX");
+                smol::Timer::after(Duration::from_secs(2)).await;
 
-            // Increment every output byte for every SubDevice by one
-            for subdevice in group.iter(&maindevice) {
-                let mut o = subdevice.outputs_raw_mut();
+                for subdevice in group.iter(&maindevice) {
+                    let Ok(name) = subdevice.sdo_read::<heapless::String<32>>(0x1008, 0).await
+                    else {
+                        // Ignore devices which failed to read the name for whatever reason
+                        continue;
+                    };
 
-                for byte in o.iter_mut() {
-                    *byte = byte.wrapping_add(1);
+                    log::info!(
+                        "Device {:#06x} name: {}",
+                        subdevice.configured_address(),
+                        name
+                    );
                 }
             }
+        };
 
-            tick_interval.next().await;
-        }
+        let pdi_task = async {
+            loop {
+                // Graceful shutdown on Ctrl + C
+                if shutdown.load(Ordering::Relaxed) {
+                    log::info!("Shutting down...");
+
+                    break;
+                }
+
+                group.tx_rx(&maindevice).await.expect("TX/RX");
+
+                // Increment every output byte for every SubDevice by one
+                for subdevice in group.iter(&maindevice) {
+                    let mut o = subdevice.outputs_raw_mut();
+
+                    for byte in o.iter_mut() {
+                        *byte = byte.wrapping_add(1);
+                    }
+                }
+
+                tick_interval.next().await;
+            }
+        };
+
+        smol::future::race(pdi_task, sdo_task).await;
 
         let group = group
             .into_safe_op(&maindevice)

@@ -7,6 +7,8 @@ I think stuff like TwinCAT gets away with it because they use custom NIC drivers
 Windows project which I'd love to get working which might help EtherCrab in the same way without
 having to write custom drivers.
 
+Before applying the following tweaks, **ensure your network card drivers are up to date.**
+
 ## Analysing your changes
 
 Take a Wireshark capture of your existing application **before making any changes below**. I
